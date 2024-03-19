@@ -52,6 +52,24 @@ function pronounce_one(card) {
   return card_pronounce[card].s;
 }
 
+function pronounce_list(cards) {
+  let out = "";
+  let cards_left = undefined;
+
+  do {
+    out += pronounce_one(cards[0]);
+
+    cards = _.tail(cards);
+    cards_left = cards.length;
+
+    if (cards_left === 1)
+      out += " and ";
+    else if (cards_left > 0)
+      out += ", ";
+  } while (cards_left > 0);
+
+  return out;
+}
 
 const suite = _.range(1, 13+1);
 
@@ -77,6 +95,9 @@ function random_deck(decks) {
 }
 
 function max_score_le_n(cards, n) {
+  if (n < 0)
+    return undefined;
+
   if (cards.length === 0)
     return 0;
 
@@ -138,6 +159,8 @@ class Game {
     this.deck = deck;
     this.player = new Hand();
     this.dealer = new Hand();
+
+    this.finished = false;
     
     this.dealer.draw(this.deck);
 
@@ -160,6 +183,14 @@ function asr_to_event(asr_event) {
     return "HIT";
   case "stand":
     return "STAND";
+  case "my score":
+    return "MY_SCORE";
+  case "my cards":
+    return "MY_CARDS";
+  case "your score":
+    return "YOUR_SCORE";
+  case "your cards":
+    return "YOUR_CARDS";
   }
 
   return "NOT_RECOGNIZED";
@@ -198,10 +229,35 @@ const dealer_say_drawn_card = speak(({ game }) =>
   `I draw ${pronounce_one(_.last(game.dealer.cards))}.`
 );
 
-const explain_player_bust = speak(({ game }) =>
-  `Your score is ${game.player.min_score()}, you are bust.`
+const say_player_score = speak(({ game }) => {
+  const score = game.player.max_score();
+
+  if (game.player.min_score() < score)
+    return `you have a soft ${score}`;
+  else
+    return `your score is ${score}`;
+});
+
+const say_player_cards = speak(({ game }) => 
+  //`You have ${pronounce_list(game.player.cards)}`
+  `You ${game.finished ? "had" : "have"} ${pronounce_list(game.player.cards)}`
 );
 
+const say_dealer_score = speak(({ game }) => 
+  `My score is ${game.dealer.max_score()}`
+);
+
+const say_dealer_cards = speak(({ game }) =>
+  `I have ${pronounce_list(game.dealer.cards)}`
+);
+
+const explain_player_bust = speak(({ game }) =>
+  `Your score is ${game.player.min_score()}, you are bust. I win.`
+);
+
+const explain_dealer_bust = speak(({ game }) =>
+  `My score is ${game.dealer.min_score()}, I am bust. You win!`
+);
 
 
 const compare_scores = speak(({ game }) => {
@@ -230,7 +286,16 @@ const dmMachine = setup({
     player_say_drawn_card,
     dealer_say_drawn_card,
 
+    say_player_score,
+    say_player_cards,
+
+    say_dealer_score,
+    say_dealer_cards,
+
     explain_player_bust,
+    explain_dealer_bust,
+
+    finish_game: ({ context }) => { context.game.finished = true; },
 
     listen: ({ context }, params) => context.ssRef.send({
       type: "LISTEN",
@@ -278,9 +343,37 @@ const dmMachine = setup({
       ],
       on: {
         RECOGNISED: { actions: [ "raise_player_input" ] },
+        ASR_NOINPUT: "ExplainPlayingInput",
+
         HIT: "PlayerHit",
         STAND: "DealerPlayingIntro",
+
+        MY_SCORE: {
+          actions: "say_player_score",
+          target: "DealerSpeaking",
+        },
+        MY_CARDS: {
+          actions: "say_player_cards",
+          target: "DealerSpeaking",
+        },
+        YOUR_SCORE: {
+          actions: "say_dealer_score",
+          target: "DealerSpeaking",
+        },
+        YOUR_CARDS: {
+          actions: "say_dealer_cards",
+          target: "DealerSpeaking",
+        },
+
+        NOT_RECOGNIZED: "ExplainPlayingInput",
       },
+    },
+    ExplainPlayingInput: {
+      entry: speak(() => "Do you want to hit or stand?"),
+      on: { SPEAK_COMPLETE: "PlayerPlaying" }
+    },
+    DealerSpeaking: {
+      on: { SPEAK_COMPLETE: "PlayerPlaying" },
     },
     PlayerHit: {
       entry: [
@@ -331,16 +424,21 @@ const dmMachine = setup({
 
     PlayerBust: {
       entry: "explain_player_bust",
-      on: { SPEAK_COMPLETE: "AskPlayAgain" },
+      on: { SPEAK_COMPLETE: "FinishGame" },
     },
     DealerBust: {
       entry: "explain_dealer_bust",
-      on: { SPEAK_COMPLETE: "AskPlayAgain" },
+      on: { SPEAK_COMPLETE: "FinishGame" },
     },
 
     CompareScores: {
       entry: "compare_scores",
-      on: { SPEAK_COMPLETE: "AskPlayAgain" },
+      on: { SPEAK_COMPLETE: "FinishGame" },
+    },
+
+    FinishGame: {
+      entry: "finish_game",
+      always: "AskPlayAgain",
     },
 
     AskPlayAgain: {
@@ -352,8 +450,12 @@ const dmMachine = setup({
       entry: "listen",
       on: {
         RECOGNISED: { actions: "raise_play_again_input" },
+        ASR_NOINPUT: "AskPlayAgain",
+
         YES: "Deal",
         NO: "Done",
+
+        NOT_RECOGNIZED: "AskPlayAgain",
       },
     },
 
