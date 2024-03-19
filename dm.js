@@ -3,9 +3,16 @@ import { assign, createActor, setup, raise } from "xstate";
 import { speechstate } from "speechstate";
 import { createBrowserInspector } from "@statelyai/inspect";
 import { _ } from "lodash";
-import { KEY } from "./azure.js";
+import { KEY, NLU_KEY } from "./azure.js";
 
 const inspector = createBrowserInspector();
+
+const azureLanguageCredentials = {
+  endpoint: "https://dialogue2024123.cognitiveservices.azure.com/language/:analyze-conversations?api-version=2022-10-01-preview",
+  key: NLU_KEY,
+  deploymentName: "blackjack",
+  projectName: "blackjack",
+};
 
 const azureCredentials = {
   endpoint:
@@ -14,6 +21,7 @@ const azureCredentials = {
 };
 
 const settings = {
+  azureLanguageCredentials: azureLanguageCredentials,
   azureCredentials: azureCredentials,
   asrDefaultCompleteTimeout: 0,
   asrDefaultNoInputTimeout: 5000,
@@ -103,16 +111,16 @@ function max_score_le_n(cards, n) {
 
   if (cards[0] === 1) {
     const ace_1_tail_score = max_score_le_n(_.tail(cards), n - 1);
-    const ace_10_tail_score = max_score_le_n(_.tail(cards), n - 10);
+    const ace_11_tail_score = max_score_le_n(_.tail(cards), n - 11);
     
-    if (ace_1_tail_score === undefined && ace_10_tail_score === undefined)
+    if (ace_1_tail_score === undefined && ace_11_tail_score === undefined)
       return undefined;
     else if (ace_1_tail_score === undefined)
-      return 10 + ace_10_tail_score;
-    else if (ace_10_tail_score === undefined)
+      return 11 + ace_11_tail_score;
+    else if (ace_11_tail_score === undefined)
       return 1 + ace_1_tail_score;
 
-    return _.max([1 + ace_1_tail_score, 10 + ace_10_tail_score]);
+    return _.max([1 + ace_1_tail_score, 11 + ace_11_tail_score]);
   }
 
   const card_0_score = card_min_score(_.head(cards));
@@ -130,6 +138,12 @@ function card_min_score(card) {
     return card;
 }
 
+function card_score_text(card) {
+  if (card === 1)
+    return "either one or eleven points";
+  else
+    return `${card_min_score(card)} points`;
+}
 
 class Hand {
   constructor() {
@@ -174,37 +188,52 @@ function random_blackjack_game() {
 }
 
 
+const common_events = new Set([
+  "MY_SCORE",
+  "MY_CARDS",
+  "YOUR_SCORE",
+  "YOUR_CARDS",
+
+  "WHAT_IS_GOOD",
+  "WHAT_IS_POOR",
+  "WHAT_IS_DECENT",
+
+  "WHAT_IS_SOFT",
+  "WHAT_IS_BUST",
+
+  "WHAT_IS_HIT",
+  "WHAT_IS_STAND",
+
+  "RULES",
+]);
+
+const play_events = new Set([
+  "HIT",
+  "STAND",
+  "STRATEGY",
+  ...common_events,
+]);
+
+const yes_no_events = new Set([
+  "YES",
+  "NO",
+  ...common_events,
+]);
+
 function asr_to_event(asr_event) {
-  console.log("asr_to_event()");
-  console.log(asr_event);
-
-  switch (asr_event.value[0].utterance.toLowerCase()) {
-  case "hit":
-    return "HIT";
-  case "stand":
-    return "STAND";
-  case "my score":
-    return "MY_SCORE";
-  case "my cards":
-    return "MY_CARDS";
-  case "your score":
-    return "YOUR_SCORE";
-  case "your cards":
-    return "YOUR_CARDS";
-  }
-
-  return "NOT_RECOGNIZED";
+  event = asr_event.nluValue.topIntent;
+  if (play_events.has(event))
+    return event;
+  else
+    return "NOT_RECOGNIZED";
 }
 
 function asr_to_yes_no(asr_event) {
-  switch (asr_event.value[0].utterance.toLowerCase()) {
-  case "yes":
-    return "YES";
-  case "no":
-    return "NO";
-  }
-
-  return "NOT_RECOGNIZED";
+  event = asr_event.nluValue.topIntent;
+  if (yes_no_events.has(event))
+    return event;
+  else
+    return "NOT_RECOGNIZED";
 }
 
 
@@ -212,30 +241,46 @@ function speak(utterance_fn) {
   return ({ context }) => context.ssRef.send({
     type: "SPEAK",
     value: {
-      utterance: utterance_fn({ game: context.game }),
+      utterance: utterance_fn({ context, game: context.game }),
     }
   });
 }
 
-const say_deal = speak(({ game }) =>
-  `I have ${pronounce_one(game.dealer.cards[0])}, you have ${pronounce_two(game.player.cards)}.`
-);
 
-const player_say_drawn_card = speak(({ game }) =>
-  `You drew ${pronounce_one(_.last(game.player.cards))}.`
-);
-
-const dealer_say_drawn_card = speak(({ game }) =>
-  `I draw ${pronounce_one(_.last(game.dealer.cards))}.`
-);
-
-const say_player_score = speak(({ game }) => {
+function player_score_text(game) {
   const score = game.player.max_score();
 
-  if (game.player.min_score() < score)
+  if (game.finished)
+    return `your score was ${score}`;
+  else if (game.player.min_score() < score)
     return `you have a soft ${score}`;
   else
     return `your score is ${score}`;
+}
+
+const say_deal = speak(({ context, game }) => {
+  let out = `I'll deal the cards. I drew ${pronounce_one(game.dealer.cards[0])}, you got ${pronounce_two(game.player.cards)}. `;
+  if (context.explaining)
+    out += player_score_text(game);
+  return out;
+});
+
+function maybe_explain_card(context, card) {
+  return context.explaining ? `, that's worth ${card_score_text(card)}` : "";
+}
+
+const player_say_drawn_card = speak(({ context, game }) => {
+  const card = _.last(game.player.cards);
+  return `You drew ${pronounce_one(card)}` + maybe_explain_card(context, card);
+});
+
+const dealer_say_drawn_card = speak(({ context, game }) => {
+  const card = _.last(game.dealer.cards);
+  return `I draw ${pronounce_one(card)}` + maybe_explain_card(context, card);
+});
+
+const say_player_score = speak(({ game }) => {
+  return player_score_text(game);
 });
 
 const say_player_cards = speak(({ game }) => 
@@ -244,12 +289,26 @@ const say_player_cards = speak(({ game }) =>
 );
 
 const say_dealer_score = speak(({ game }) => 
-  `My score is ${game.dealer.max_score()}`
+  `My score ${game.finished ? "was" : "is"} ${game.dealer.max_score()}`
 );
 
 const say_dealer_cards = speak(({ game }) =>
-  `I have ${pronounce_list(game.dealer.cards)}`
+  `I ${game.finished ? "had" : "have"} ${pronounce_list(game.dealer.cards)}`
 );
+
+
+const say_strategy = speak(({ game }) => {
+  const dealer_card = game.dealer.cards[0];
+
+  if (dealer_card === 1 || dealer_card >= 7) {
+    return "I have a good card, so I suggest you try for a score of 17 or higher";
+  } else if (dealer_card >= 4) {
+    return "I have a poor card, so I suggest you try for a score of 12 or higher";
+  } else { // 2 or 3
+    return "I have a decent card, so I suggest you try for a score of 13 or higher";
+  }
+});
+
 
 const explain_player_bust = speak(({ game }) =>
   `Your score is ${game.player.min_score()}, you are bust. I win.`
@@ -273,8 +332,20 @@ const compare_scores = speak(({ game }) => {
 
 const dmMachine = setup({
   actions: {
+    set_explaining_mode: ({ context }) => { context.explaining = true; },
+
+    raise_rules_input: raise(({ context, event }) => ({ type: asr_to_yes_no(event) })),
     raise_player_input: raise(({ context, event }) => ({ type: asr_to_event(event) })),
     raise_play_again_input: raise(( {context, event }) => ({ type: asr_to_yes_no(event) })),
+
+    say_rules: speak(() => 
+      "I'll deal you cards one at a time, "
+        + "the goal is to get as close to 21 as possible, but if you go above it, you lose. "
+        + "<emphasis level='strong'>You</emphasis> can stop at any time, but when it's <emphasis level='strong'>>my</emphasis> turn, I have to continue until my score is 17 or above. "
+        +  "Twos to tens are worth that many points, jacks, queens and kings are worth ten points, and aces are worth either one or 11 points. "
+        + "We'll figure the rest out as we go!"
+    ),
+
 
     player_draw: ({ context }) => { context.game.player.draw(context.game.deck); },
     dealer_draw: ({ context }) => { context.game.dealer.draw(context.game.deck); },
@@ -292,6 +363,8 @@ const dmMachine = setup({
     say_dealer_score,
     say_dealer_cards,
 
+    say_strategy,
+
     explain_player_bust,
     explain_dealer_bust,
 
@@ -299,7 +372,7 @@ const dmMachine = setup({
 
     listen: ({ context }, params) => context.ssRef.send({
       type: "LISTEN",
-      value: {},
+      value: { nlu: true },
     }),
   },
   guards: {
@@ -324,29 +397,171 @@ const dmMachine = setup({
       on: { ASRTTS_READY: "WaitToStart" },
     },
     WaitToStart: {
+      entry: assign({ explaining: false }),
       on: {
-        CLICK: "Deal",
+        CLICK: "Game",
       },
     },
-    Deal: {
-      entry: [
-        assign({ game: () => random_blackjack_game() }),
-        "say_deal",
-      ],
-      on: {
-        SPEAK_COMPLETE: "PlayerPlaying",
-      },
-    },
-    PlayerPlaying: {
-      entry: [
-        { type: "listen" },
-      ],
-      on: {
-        RECOGNISED: { actions: [ "raise_player_input" ] },
-        ASR_NOINPUT: "ExplainPlayingInput",
+    Game: {
+      initial: "Intro",
+      onDone: "WaitToStart",
+      states: {
+        Intro: {
+          entry: speak(() => "Let's play blackjack! Do you know the rules?"),
+          on: { SPEAK_COMPLETE: "RulesListen" },
+        },
+        RulesListen: {
+          entry: "listen",
+          on: {
+            RECOGNISED: { actions: "raise_rules_input" },
+            YES: "Deal",
+            NO: "Rules",
+          },
+        },
+        Rules: {
+          entry: [
+            "set_explaining_mode",
+            "say_rules",
+          ],
+          on: { SPEAK_COMPLETE: "Deal" },
+        },
+        Deal: {
+          entry: [
+            assign({ game: () => random_blackjack_game() }),
+            "say_deal",
+          ],
+          on: {
+            SPEAK_COMPLETE: "PlayerPlaying",
+          },
+        },
+        PlayerPlaying: {
+          entry: [
+            { type: "listen" },
+          ],
+          on: {
+            RECOGNISED: { actions: [ "raise_player_input" ] },
+            ASR_NOINPUT: "ExplainPlayingInput",
 
-        HIT: "PlayerHit",
-        STAND: "DealerPlayingIntro",
+            HIT: "PlayerHit",
+            STAND: "DealerPlayingIntro",
+
+            STRATEGY: {
+              actions: "say_strategy",
+              target: "DealerSpeaking",
+            },
+
+            NOT_RECOGNIZED: "ExplainPlayingInput",
+          },
+        },
+        ExplainPlayingInput: {
+          entry: speak(({context}) => "Do you want to hit or stand?" + (context.explaining ? " Hit if you want another card, stand if you're done" : "")),
+          on: { SPEAK_COMPLETE: "PlayerPlaying" }
+        },
+        DealerSpeaking: {
+          on: { SPEAK_COMPLETE: "PlayerPlaying" },
+        },
+        PlayerHit: {
+          entry: [
+            "player_draw",
+            "player_say_drawn_card",
+          ],
+          on: {
+            SPEAK_COMPLETE: [
+              {
+                guard: "player_bust",
+                target: "PlayerBust",
+              },
+              {
+                target: "PlayerPlaying",
+              },
+            ],
+          },
+        },
+
+        DealerPlayingIntro: {
+          entry: speak(({ game }) => `My turn. I had ${pronounce_one(game.dealer.cards[0])}`),
+          on: {
+            SPEAK_COMPLETE: "DealerPlaying",
+          },
+        },
+        DealerPlaying: {
+          entry: [
+            "dealer_draw",
+            "dealer_say_drawn_card",
+          ],
+          on: {
+            SPEAK_COMPLETE: [
+              {
+                guard: "dealer_bust",
+                target: "DealerBust",
+              },
+              {
+                guard: "dealer_score_ge_17",
+                target: "CompareScores",
+              },
+              {
+                target: "DealerPlaying",
+                reenter: true,
+              },
+            ],
+          }
+        },
+
+        PlayerBust: {
+          entry: "explain_player_bust",
+          on: { SPEAK_COMPLETE: "FinishGame" },
+        },
+        DealerBust: {
+          entry: "explain_dealer_bust",
+          on: { SPEAK_COMPLETE: "FinishGame" },
+        },
+
+        CompareScores: {
+          entry: "compare_scores",
+          on: { SPEAK_COMPLETE: "FinishGame" },
+        },
+
+        FinishGame: {
+          entry: "finish_game",
+          always: "AskPlayAgain",
+        },
+
+        AskPlayAgain: {
+          initial: "Ask",
+          states: {
+            Ask: {
+              entry: speak(() => "Do you want to play again?"),
+              on: { SPEAK_COMPLETE: "Listen" },
+            },
+            Listen: {
+              entry: "listen",
+              on: {
+                RECOGNISED: { actions: "raise_play_again_input" },
+                //ASR_NOINPUT: "Ask",
+
+                YES: "#DM.Game.Deal",
+                NO: "#DM.Game.Done",
+
+                NOT_RECOGNIZED: "Ask",
+              },
+            },
+          },
+        },
+
+        Done: {
+          type: "final",
+        },
+        Hist: {
+          type: "history",
+        },
+      },
+      on: {
+        ASR_NOINPUT: {
+          actions: speak(() => "I didn't hear you"),
+          target: "DealerSpeaking",
+        },
+
+        // handle common grammar entries
 
         MY_SCORE: {
           actions: "say_player_score",
@@ -365,102 +580,47 @@ const dmMachine = setup({
           target: "DealerSpeaking",
         },
 
-        NOT_RECOGNIZED: "ExplainPlayingInput",
+        WHAT_IS_GOOD: {
+          actions: speak(() => "Seven or higher is a good dealer card"),
+          target: "DealerSpeaking",
+        },
+        WHAT_IS_POOR: {
+          actions: speak(() => "Poor dealer cards are 4, 5 and 6"),
+          target: "DealerSpeaking",
+        },
+        WHAT_IS_DECENT: {
+          actions: speak(() => "2 and 3 are decent dealer cards"),
+          target: "DealerSpeaking",
+        },
+
+        WHAT_IS_SOFT: {
+          actions: speak(() => "A soft hand is when you have an ace, which can either count as one or eleven, your choice"),
+          target: "DealerSpeaking",
+        },
+        WHAT_IS_BUST: {
+          actions: speak(() => "That's just something we say when your score is above 21"),
+          target: "DealerSpeaking",
+        },
+
+        WHAT_IS_HIT: {
+          actions: speak(() => "Hit means that you want another card"),
+          target: "DealerSpeaking",
+        },
+        WHAT_IS_STAND: {
+          actions: speak(() => "Stand means that you want to stop"),
+          target: "DealerSpeaking",
+        },
+
+        RULES: {
+          actions: "say_rules",
+          target: "DealerSpeaking",
+        },
       },
-    },
-    ExplainPlayingInput: {
-      entry: speak(() => "Do you want to hit or stand?"),
-      on: { SPEAK_COMPLETE: "PlayerPlaying" }
     },
     DealerSpeaking: {
-      on: { SPEAK_COMPLETE: "PlayerPlaying" },
-    },
-    PlayerHit: {
-      entry: [
-        "player_draw",
-        "player_say_drawn_card",
-      ],
       on: {
-        SPEAK_COMPLETE: [
-          {
-            guard: "player_bust",
-            target: "PlayerBust",
-          },
-          {
-            target: "PlayerPlaying",
-          },
-        ],
-      },
-    },
-
-    DealerPlayingIntro: {
-      entry: speak(({ game }) => `My turn. I had ${pronounce_one(game.dealer.cards[0])}`),
-      on: {
-        SPEAK_COMPLETE: "DealerPlaying",
-      },
-    },
-    DealerPlaying: {
-      entry: [
-        "dealer_draw",
-        "dealer_say_drawn_card",
-      ],
-      on: {
-        SPEAK_COMPLETE: [
-          {
-            guard: "dealer_bust",
-            target: "DealerBust",
-          },
-          {
-            guard: "dealer_score_ge_17",
-            target: "CompareScores",
-          },
-          {
-            target: "DealerPlaying",
-            reenter: true,
-          },
-        ],
+        SPEAK_COMPLETE: "Game.Hist",
       }
-    },
-
-    PlayerBust: {
-      entry: "explain_player_bust",
-      on: { SPEAK_COMPLETE: "FinishGame" },
-    },
-    DealerBust: {
-      entry: "explain_dealer_bust",
-      on: { SPEAK_COMPLETE: "FinishGame" },
-    },
-
-    CompareScores: {
-      entry: "compare_scores",
-      on: { SPEAK_COMPLETE: "FinishGame" },
-    },
-
-    FinishGame: {
-      entry: "finish_game",
-      always: "AskPlayAgain",
-    },
-
-    AskPlayAgain: {
-      //entry: "ask_play_again",
-      entry: speak(() => "Do you want to play again?"),
-      on: { SPEAK_COMPLETE: "ListenPlayAgain" },
-    },
-    ListenPlayAgain: {
-      entry: "listen",
-      on: {
-        RECOGNISED: { actions: "raise_play_again_input" },
-        ASR_NOINPUT: "AskPlayAgain",
-
-        YES: "Deal",
-        NO: "Done",
-
-        NOT_RECOGNIZED: "AskPlayAgain",
-      },
-    },
-
-    Done: {
-      always: "WaitToStart",
     },
   },
 });
